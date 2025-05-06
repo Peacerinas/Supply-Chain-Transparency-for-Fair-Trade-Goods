@@ -123,3 +123,78 @@
 (define-read-only (get-last-token-id)
     (ok (var-get last-batch-id))
 )
+
+(define-map quality-scores
+    uint
+    {
+        base-score: uint,
+        quality-metrics: (list 5 uint),
+        last-updated: uint,
+        verified: bool
+    }
+)
+
+(define-public (set-batch-quality (batch-id uint) (metrics (list 5 uint)))
+    (let
+        ((batch (unwrap! (map-get? batch-details batch-id) (err err-not-found)))
+         (avg-score (/ (fold + metrics u0) u5)))
+        
+        (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+        
+        (map-set quality-scores batch-id
+            {
+                base-score: avg-score,
+                quality-metrics: metrics,
+                last-updated: stacks-block-height,
+                verified: true
+            })
+        (ok avg-score)))
+
+(define-read-only (get-batch-quality (batch-id uint))
+    (ok (map-get? quality-scores batch-id)))
+
+
+(define-map batch-timeline
+    { batch-id: uint, event-id: uint }
+    {
+        event-type: (string-ascii 24),
+        actor: principal,
+        details: (string-ascii 64),
+        timestamp: uint
+    }
+)
+
+(define-map batch-event-counter
+    uint
+    uint
+)
+
+(define-read-only (get-batch-timeline (batch-id uint))
+    (let
+        ((event-count (default-to u0 (map-get? batch-event-counter batch-id))))
+        (ok {
+            batch-id: batch-id,
+            total-events: event-count,
+            timeline: (map-get? batch-timeline (tuple (batch-id batch-id) (event-id event-count)))
+        })))
+
+(define-private (record-timeline-event (batch-id uint) (event-type (string-ascii 24)) (details (string-ascii 64)))
+    (let
+        ((current-count (default-to u0 (map-get? batch-event-counter batch-id)))
+         (new-count (+ current-count u1)))
+        
+        (map-set batch-timeline 
+            { batch-id: batch-id, event-id: new-count }
+            {
+                event-type: event-type,
+                actor: tx-sender,
+                details: details,
+                timestamp: stacks-block-height
+            })
+        (map-set batch-event-counter batch-id new-count)
+        (ok new-count)))
+
+(define-public (add-batch-note (batch-id uint) (note (string-ascii 64)))
+    (let
+        ((batch (unwrap! (map-get? batch-details batch-id) (err err-not-found))))
+        (ok true)))
