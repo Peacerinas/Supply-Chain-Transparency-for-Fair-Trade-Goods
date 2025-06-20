@@ -7,7 +7,36 @@
 (define-constant err-not-found (err u101))
 (define-constant err-already-exists (err u102))
 (define-constant err-invalid-stage (err u103))
+(define-map authorized-verifiers
+    principal
+    {
+        verifier-type: (string-ascii 32),
+        active: bool,
+        verification-count: uint
+    }
+)
 
+(define-map batch-verifications
+    { batch-id: uint, verifier: principal }
+    {
+        verification-type: (string-ascii 32),
+        verified: bool,
+        verification-date: uint,
+        notes: (string-ascii 128)
+    }
+)
+
+(define-map batch-verification-summary
+    uint
+    {
+        total-verifications: uint,
+        passed-verifications: uint,
+        verification-score: uint,
+        fully-verified: bool
+    }
+)
+
+(define-data-var min-verifications-required uint u2)
 (define-map batch-details
     uint 
     {
@@ -71,15 +100,7 @@
     )
 )
 
-(define-public (certify-fair-trade (batch-id uint))
-    (begin
-        (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
-        (match (map-get? batch-details batch-id)
-            batch (ok (map-set batch-details batch-id (merge batch {fair-trade-certified: true})))
-            (err err-not-found)
-        )
-    )
-)
+
 
 (define-read-only (get-batch-details (batch-id uint))
     (ok (map-get? batch-details batch-id))
@@ -134,6 +155,105 @@
     }
 )
 
+
+
+(define-public (add-verifier (verifier principal) (verifier-type (string-ascii 32)))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+        (map-set authorized-verifiers verifier
+            {
+                verifier-type: verifier-type,
+                active: true,
+                verification-count: u0
+            })
+        (ok true)
+    )
+)
+
+(define-public (remove-verifier (verifier principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+        (match (map-get? authorized-verifiers verifier)
+            verifier-data (ok (map-set authorized-verifiers verifier (merge verifier-data { active: false })))
+            (err err-not-found)
+        )
+    )
+)
+
+(define-public (verify-batch (batch-id uint) (verification-type (string-ascii 32)) (passed bool) (notes (string-ascii 128)))
+    (let
+        (
+            (verifier-data (unwrap! (map-get? authorized-verifiers tx-sender) (err u104)))
+        )
+        (asserts! (get active verifier-data) (err u105))
+        
+        (map-set batch-verifications { batch-id: batch-id, verifier: tx-sender }
+            {
+                verification-type: verification-type,
+                verified: passed,
+                verification-date: stacks-block-height,
+                notes: notes
+            })
+        
+        (map-set authorized-verifiers tx-sender 
+            (merge verifier-data { verification-count: (+ (get verification-count verifier-data) u1) }))
+        
+        ;; (try! (update-verification-summary batch-id))
+        (ok true)
+    )
+)
+
+(define-private (update-verification-summary (batch-id uint))
+    (let
+        (
+            (current-summary (default-to { total-verifications: u0, passed-verifications: u0, verification-score: u0, fully-verified: false } 
+                                        (map-get? batch-verification-summary batch-id)))
+            (new-total (+ (get total-verifications current-summary) u1))
+            (verification-passed (match (map-get? batch-verifications { batch-id: batch-id, verifier: tx-sender })
+                                    verification-data (get verified verification-data)
+                                    false))
+            (new-passed (if verification-passed (+ (get passed-verifications current-summary) u1) (get passed-verifications current-summary)))
+            (new-score (if (> new-total u0) (/ (* new-passed u100) new-total) u0))
+            (is-fully-verified (>= new-passed (var-get min-verifications-required)))
+        )
+        (map-set batch-verification-summary batch-id
+            {
+                total-verifications: new-total,
+                passed-verifications: new-passed,
+                verification-score: new-score,
+                fully-verified: is-fully-verified
+            })
+        (ok true)
+    )
+)
+
+(define-read-only (get-batch-verification-status (batch-id uint))
+    (ok (map-get? batch-verification-summary batch-id))
+)
+
+(define-read-only (get-verifier-info (verifier principal))
+    (ok (map-get? authorized-verifiers verifier))
+)
+
+(define-read-only (get-batch-verification (batch-id uint) (verifier principal))
+    (ok (map-get? batch-verifications { batch-id: batch-id, verifier: verifier }))
+)
+
+(define-public (set-min-verifications (min-count uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+        (var-set min-verifications-required min-count)
+        (ok true)
+    )
+)
+
+(define-read-only (is-batch-fully-verified (batch-id uint))
+    (match (map-get? batch-verification-summary batch-id)
+        summary (ok (get fully-verified summary))
+        (err err-not-found)
+    )
+)
+
 (define-public (set-batch-quality (batch-id uint) (metrics (list 5 uint)))
     (let
         ((batch (unwrap! (map-get? batch-details batch-id) (err err-not-found)))
@@ -172,11 +292,12 @@
 (define-read-only (get-batch-timeline (batch-id uint))
     (let
         ((event-count (default-to u0 (map-get? batch-event-counter batch-id))))
-        (ok {
+        {
             batch-id: batch-id,
             total-events: event-count,
             timeline: (map-get? batch-timeline (tuple (batch-id batch-id) (event-id event-count)))
-        })))
+        })
+)
 
 (define-private (record-timeline-event (batch-id uint) (event-type (string-ascii 24)) (details (string-ascii 64)))
     (let
@@ -198,3 +319,4 @@
     (let
         ((batch (unwrap! (map-get? batch-details batch-id) (err err-not-found))))
         (ok true)))
+
