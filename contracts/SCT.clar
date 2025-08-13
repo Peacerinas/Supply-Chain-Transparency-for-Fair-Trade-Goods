@@ -320,3 +320,279 @@
         ((batch (unwrap! (map-get? batch-details batch-id) (err err-not-found))))
         (ok true)))
 
+;; =================================================================================
+;; CARBON FOOTPRINT TRACKING SYSTEM
+;; =================================================================================
+
+;; Error constants for carbon tracking
+(define-constant err-carbon-limit-exceeded (err u300))
+(define-constant err-invalid-transport-method (err u301))
+(define-constant err-carbon-already-recorded (err u302))
+(define-constant err-invalid-emission-value (err u303))
+
+;; Carbon footprint data for each stage
+(define-map stage-carbon-footprint
+    { batch-id: uint, stage-id: uint }
+    {
+        co2-emissions: uint,        ;; CO2 in grams
+        transport-method: (string-ascii 32),
+        distance-km: uint,
+        energy-consumption: uint,    ;; Energy in kWh
+        offset-applied: uint,        ;; Carbon offset in grams CO2
+        recorded-by: principal,
+        timestamp: uint
+    }
+)
+
+;; Total carbon footprint summary per batch
+(define-map batch-carbon-summary
+    uint
+    {
+        total-co2-emissions: uint,
+        total-distance: uint,
+        total-energy-used: uint,
+        total-offsets: uint,
+        net-carbon-footprint: uint,
+        sustainability-score: uint,  ;; Score out of 100
+        carbon-neutral: bool,
+        last-updated: uint
+    }
+)
+
+;; Carbon emission limits and thresholds
+(define-data-var max-carbon-per-stage uint u5000)     ;; Max 5kg CO2 per stage
+(define-data-var carbon-neutral-threshold uint u100)  ;; Max 100g net emissions for carbon neutral
+(define-data-var sustainability-multiplier uint u20)  ;; Multiplier for sustainability score calculation
+
+;; Valid transport methods with emission factors (grams CO2 per km)
+(define-map transport-emission-factors
+    (string-ascii 32)
+    uint
+)
+
+;; Carbon offset registry
+(define-map carbon-offsets
+    { batch-id: uint, offset-id: uint }
+    {
+        offset-type: (string-ascii 32),
+        co2-offset: uint,
+        verification-authority: principal,
+        purchase-date: uint,
+        cost-per-tonne: uint
+    }
+)
+
+(define-map batch-offset-counter
+    uint
+    uint
+)
+
+;; Initialize transport emission factors
+(define-public (initialize-transport-factors)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+        (map-set transport-emission-factors "truck" u300)      ;; 300g CO2/km
+        (map-set transport-emission-factors "ship" u50)       ;; 50g CO2/km
+        (map-set transport-emission-factors "plane" u1200)    ;; 1200g CO2/km
+        (map-set transport-emission-factors "train" u80)      ;; 80g CO2/km
+        (map-set transport-emission-factors "electric-truck" u100) ;; 100g CO2/km
+        (map-set transport-emission-factors "bicycle" u0)     ;; 0g CO2/km
+        (ok true)
+    )
+)
+
+;; Record carbon footprint for a specific stage
+(define-public (record-stage-carbon-footprint 
+    (batch-id uint) 
+    (stage-id uint) 
+    (transport-method (string-ascii 32)) 
+    (distance-km uint) 
+    (energy-consumption uint))
+    (let
+        (
+            (batch (unwrap! (map-get? batch-details batch-id) (err err-not-found)))
+            (emission-factor (unwrap! (map-get? transport-emission-factors transport-method) (err err-invalid-transport-method)))
+            (transport-emissions (* distance-km emission-factor))
+            (energy-emissions (* energy-consumption u400))  ;; Assume 400g CO2 per kWh
+            (total-emissions (+ transport-emissions energy-emissions))
+            (existing-record (map-get? stage-carbon-footprint { batch-id: batch-id, stage-id: stage-id }))
+        )
+        ;; Validate inputs
+        (asserts! (<= stage-id (get current-stage batch)) (err err-invalid-stage))
+        (asserts! (is-none existing-record) (err err-carbon-already-recorded))
+        (asserts! (<= total-emissions (var-get max-carbon-per-stage)) (err err-carbon-limit-exceeded))
+        
+        ;; Record stage carbon footprint
+        (map-set stage-carbon-footprint { batch-id: batch-id, stage-id: stage-id }
+            {
+                co2-emissions: total-emissions,
+                transport-method: transport-method,
+                distance-km: distance-km,
+                energy-consumption: energy-consumption,
+                offset-applied: u0,
+                recorded-by: tx-sender,
+                timestamp: stacks-block-height
+            })
+        
+        ;; Update batch carbon summary
+        (try! (update-batch-carbon-summary batch-id))
+        (ok total-emissions)
+    )
+)
+
+;; Purchase and apply carbon offsets
+(define-public (purchase-carbon-offset 
+    (batch-id uint) 
+    (offset-type (string-ascii 32)) 
+    (co2-offset uint) 
+    (cost-per-tonne uint))
+    (let
+        (
+            (batch (unwrap! (map-get? batch-details batch-id) (err err-not-found)))
+            (current-offset-count (default-to u0 (map-get? batch-offset-counter batch-id)))
+            (new-offset-id (+ current-offset-count u1))
+        )
+        (asserts! (> co2-offset u0) (err err-invalid-emission-value))
+        
+        ;; Record carbon offset purchase
+        (map-set carbon-offsets { batch-id: batch-id, offset-id: new-offset-id }
+            {
+                offset-type: offset-type,
+                co2-offset: co2-offset,
+                verification-authority: tx-sender,
+                purchase-date: stacks-block-height,
+                cost-per-tonne: cost-per-tonne
+            })
+        
+        (map-set batch-offset-counter batch-id new-offset-id)
+        
+        ;; Update batch carbon summary
+        (try! (update-batch-carbon-summary batch-id))
+        (ok new-offset-id)
+    )
+)
+
+;; Calculate and update batch carbon summary
+(define-private (update-batch-carbon-summary (batch-id uint))
+    (let
+        (
+            (batch (unwrap! (map-get? batch-details batch-id) (err err-not-found)))
+            (current-stage (get current-stage batch))
+            (stage-totals (calculate-stage-totals batch-id current-stage))
+            (total-offsets (calculate-total-offsets batch-id))
+            (total-emissions (get total-emissions stage-totals))
+            (total-distance (get total-distance stage-totals))
+            (total-energy (get total-energy stage-totals))
+            (net-footprint (if (> total-emissions total-offsets) (- total-emissions total-offsets) u0))
+            (sustainability-score (calculate-sustainability-score total-emissions total-offsets total-distance))
+            (is-carbon-neutral (<= net-footprint (var-get carbon-neutral-threshold)))
+        )
+        (map-set batch-carbon-summary batch-id
+            {
+                total-co2-emissions: total-emissions,
+                total-distance: total-distance,
+                total-energy-used: total-energy,
+                total-offsets: total-offsets,
+                net-carbon-footprint: net-footprint,
+                sustainability-score: sustainability-score,
+                carbon-neutral: is-carbon-neutral,
+                last-updated: stacks-block-height
+            })
+        (ok true)
+    )
+)
+
+;; Helper function to calculate stage totals
+(define-private (calculate-stage-totals (batch-id uint) (max-stage uint))
+    (let
+        (
+            (stage-1 (default-to { co2-emissions: u0, distance-km: u0, energy-consumption: u0 } 
+                                 (map-get? stage-carbon-footprint { batch-id: batch-id, stage-id: u1 })))
+            (stage-2 (default-to { co2-emissions: u0, distance-km: u0, energy-consumption: u0 } 
+                                 (map-get? stage-carbon-footprint { batch-id: batch-id, stage-id: u2 })))
+            (stage-3 (default-to { co2-emissions: u0, distance-km: u0, energy-consumption: u0 } 
+                                 (map-get? stage-carbon-footprint { batch-id: batch-id, stage-id: u3 })))
+            (stage-4 (default-to { co2-emissions: u0, distance-km: u0, energy-consumption: u0 } 
+                                 (map-get? stage-carbon-footprint { batch-id: batch-id, stage-id: u4 })))
+            (stage-5 (default-to { co2-emissions: u0, distance-km: u0, energy-consumption: u0 } 
+                                 (map-get? stage-carbon-footprint { batch-id: batch-id, stage-id: u5 })))
+        )
+        {
+            total-emissions: (+ (+ (+ (+ (get co2-emissions stage-1) (get co2-emissions stage-2)) 
+                                      (get co2-emissions stage-3)) (get co2-emissions stage-4)) (get co2-emissions stage-5)),
+            total-distance: (+ (+ (+ (+ (get distance-km stage-1) (get distance-km stage-2)) 
+                                     (get distance-km stage-3)) (get distance-km stage-4)) (get distance-km stage-5)),
+            total-energy: (+ (+ (+ (+ (get energy-consumption stage-1) (get energy-consumption stage-2)) 
+                                   (get energy-consumption stage-3)) (get energy-consumption stage-4)) (get energy-consumption stage-5))
+        }
+    )
+)
+
+;; Helper function to calculate total offsets
+(define-private (calculate-total-offsets (batch-id uint))
+    (let
+        (
+            (offset-count (default-to u0 (map-get? batch-offset-counter batch-id)))
+            (offset-1 (if (>= offset-count u1) (default-to { co2-offset: u0 } (map-get? carbon-offsets { batch-id: batch-id, offset-id: u1 })) { co2-offset: u0 }))
+            (offset-2 (if (>= offset-count u2) (default-to { co2-offset: u0 } (map-get? carbon-offsets { batch-id: batch-id, offset-id: u2 })) { co2-offset: u0 }))
+            (offset-3 (if (>= offset-count u3) (default-to { co2-offset: u0 } (map-get? carbon-offsets { batch-id: batch-id, offset-id: u3 })) { co2-offset: u0 }))
+        )
+        (+ (+ (get co2-offset offset-1) (get co2-offset offset-2)) (get co2-offset offset-3))
+    )
+)
+
+;; Calculate sustainability score (0-100)
+(define-private (calculate-sustainability-score (total-emissions uint) (total-offsets uint) (total-distance uint))
+    (let
+        (
+            (efficiency-score (if (> total-distance u0) (/ u100000 (/ total-emissions total-distance)) u100))
+            (offset-score (if (> total-emissions u0) (/ (* total-offsets u100) total-emissions) u100))
+            (combined-score (/ (+ efficiency-score offset-score) u2))
+        )
+        (if (> combined-score u100) u100 combined-score)
+    )
+)
+
+;; Read-only functions for carbon tracking
+(define-read-only (get-stage-carbon-footprint (batch-id uint) (stage-id uint))
+    (ok (map-get? stage-carbon-footprint { batch-id: batch-id, stage-id: stage-id }))
+)
+
+(define-read-only (get-batch-carbon-summary (batch-id uint))
+    (ok (map-get? batch-carbon-summary batch-id))
+)
+
+(define-read-only (get-carbon-offset (batch-id uint) (offset-id uint))
+    (ok (map-get? carbon-offsets { batch-id: batch-id, offset-id: offset-id }))
+)
+
+(define-read-only (get-transport-emission-factor (transport-method (string-ascii 32)))
+    (ok (map-get? transport-emission-factors transport-method))
+)
+
+(define-read-only (is-batch-carbon-neutral (batch-id uint))
+    (match (map-get? batch-carbon-summary batch-id)
+        summary (ok (get carbon-neutral summary))
+        (err err-not-found)
+    )
+)
+
+;; Administrative functions
+(define-public (set-carbon-limits (max-per-stage uint) (neutral-threshold uint) (score-multiplier uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+        (var-set max-carbon-per-stage max-per-stage)
+        (var-set carbon-neutral-threshold neutral-threshold)
+        (var-set sustainability-multiplier score-multiplier)
+        (ok true)
+    )
+)
+
+(define-public (add-transport-method (method (string-ascii 32)) (emission-factor uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) (err err-owner-only))
+        (map-set transport-emission-factors method emission-factor)
+        (ok true)
+    )
+)
+
