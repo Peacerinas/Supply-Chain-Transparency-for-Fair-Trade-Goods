@@ -14,6 +14,11 @@ epoch = 3.1
 path = 'contracts/SCT-Rewards.clar'
 clarity_version = 3
 epoch = 3.1
+
+[contracts.consumer-reviews]
+path = 'contracts/consumer-reviews.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
